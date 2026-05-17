@@ -1,5 +1,5 @@
 {
-  "_comment": "Only two channels are supported: 'preview' (ROCm 7.2.1) and 'stable' (ROCm 7.12.x). Both pull binaries directly from AMD's official deb mirror at https://repo.radeon.com/rocm/apt/. Any other version or source must be rejected by the install step.",
+  "_comment": "Only two channels are supported: 'preview' (ROCm 7.2.1 from AMD apt) and 'stable' (ROCm 7.2.2 SDK bundle from lemonade-sdk/rocm-stable GitHub release). Any other version or source must be rejected by the install step.",
   "_source_of_truth": "https://repo.radeon.com/rocm/apt/",
   "_allowed_channels": ["preview", "stable"],
   "preview": {
@@ -9,10 +9,10 @@
     "description": "AMD-official ROCm 7.2.1 from repo.radeon.com"
   },
   "stable": {
-    "version_prefix": "7.12",
-    "source": "amd-apt",
-    "apt_url_prefix": "https://repo.radeon.com/rocm/apt/7.12",
-    "description": "AMD-official ROCm 7.12.x from repo.radeon.com (latest 7.12 patch release)",
-    "note": "As of 2026-04-22, 7.12 is not yet published at repo.radeon.com/rocm/apt/. Workflow fails fast until AMD publishes; no fallback to distro packages or TheRock S3."
+    "version": "7.2.2",
+    "source": "sdk-bundle",
+    "release_repo": "lemonade-sdk/rocm-stable",
+    "tarball": "rocm-7.2.2-runtime-libs.tar.gz",
+    "description": "ROCm 7.2.2 SDK bundle from lemonade-sdk/rocm-stable GitHub release"
   }
 }

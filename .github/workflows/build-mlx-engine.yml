@@ -11,7 +11,7 @@ on:
         required: false
         default: 'gfx110X,gfx1150,gfx1151,gfx120X,gfx115X_gfx120X'
       rocm_channel:
-        description: 'ROCm channel: preview (7.2.1 from AMD apt) or stable (7.12.x from AMD apt). Both sourced directly from https://repo.radeon.com/rocm/apt/. Only these two values are accepted.'
+        description: 'ROCm channel: preview (7.2.1 from AMD apt) or stable (7.2.2 SDK bundle from rocm-stable). Both channels accepted.'
         required: false
         default: 'preview'
         type: choice
@@ -24,13 +24,16 @@ on:
         default: true
         type: boolean
 
+  push:
+    branches: ["*"]
+
   pull_request:
     types: [opened, synchronize, reopened]
 
   schedule:
     # Daily: preview channel (ROCm 7.2.1 from AMD apt)
     - cron: '0 14 * * *'
-    # Weekly Monday: stable channel (ROCm 7.12.x from AMD apt)
+    # Weekly Monday: stable channel (ROCm 7.2.2 SDK bundle from rocm-stable)
     - cron: '0 16 * * 1'
 
 env:
@@ -120,16 +123,14 @@ jobs:
       env:
         CHANNEL: ${{ env.ROCM_CHANNEL }}
       run: |
-        # Allowlist: only 'preview' (7.2.1) or 'stable' (7.12.x) are accepted.
-        # Both channels must resolve to https://repo.radeon.com/rocm/apt/. Any
-        # other channel or source (distro packages, TheRock S3, nightlies, etc.)
-        # is rejected here before any install step runs.
+        # Allowlist: only 'preview' (7.2.1 from AMD apt) or 'stable' (7.2.2
+        # from SDK bundle) are accepted. Any other channel or source is
+        # rejected here before any install step runs.
         case "$CHANNEL" in
           preview|stable) ;;
           *)
             echo "::error::Unsupported ROCm channel '$CHANNEL'."
-            echo "::error::Allowed channels: preview (ROCm 7.2.1), stable (ROCm 7.12.x)."
-            echo "::error::Both channels are sourced from https://repo.radeon.com/rocm/apt/."
+            echo "::error::Allowed channels: preview (ROCm 7.2.1, AMD apt), stable (ROCm 7.2.2, SDK bundle)."
             exit 1
             ;;
         esac
@@ -183,69 +184,67 @@ jobs:
         echo "DETECTED_ROCM_VERSION=$rocm_version" >> $GITHUB_ENV
         echo "DETECTED_ROCM_CHANNEL=preview" >> $GITHUB_ENV
 
-    - name: Install ROCm (stable channel - 7.12.x from AMD apt)
+    - name: Install ROCm (stable channel - SDK bundle from rocm-stable)
       if: env.ROCM_CHANNEL == 'stable'
       run: |
-        version_prefix=$(jq -r '.stable.version_prefix' .github/rocm-channels.json)
+        rocm_version=$(jq -r '.stable.version' .github/rocm-channels.json)
         rocm_source=$(jq -r '.stable.source' .github/rocm-channels.json)
-        apt_url_prefix=$(jq -r '.stable.apt_url_prefix' .github/rocm-channels.json)
+        release_repo=$(jq -r '.stable.release_repo' .github/rocm-channels.json)
+        tarball=$(jq -r '.stable.tarball' .github/rocm-channels.json)
 
-        if [ "$rocm_source" != "amd-apt" ]; then
-          echo "::error::stable channel source must be 'amd-apt', got '$rocm_source'"
+        if [ "$rocm_source" != "sdk-bundle" ]; then
+          echo "::error::stable channel source must be 'sdk-bundle', got '$rocm_source'"
           exit 1
         fi
-        if [ "$version_prefix" != "7.12" ]; then
-          echo "::error::stable channel version_prefix is pinned to 7.12, got '$version_prefix'"
-          exit 1
+
+        # Download SDK bundle + SHA256 checksum
+        url="https://github.com/${release_repo}/releases/download/v${rocm_version}/${tarball}"
+        sha256_url="${url}.sha256"
+        echo "Downloading SDK bundle: $url"
+
+        sudo mkdir -p /opt/rocm
+        curl -fsSL "$url" -o /tmp/rocm-sdk.tar.gz
+        curl -fsSL "$sha256_url" -o /tmp/rocm-sdk.tar.gz.sha256
+
+        # Verify integrity
+        echo "Verifying SHA-256 checksum..."
+        (cd /tmp && sha256sum -c rocm-sdk.tar.gz.sha256)
+
+        # Extract to /opt/rocm
+        sudo tar -xzf /tmp/rocm-sdk.tar.gz -C /opt/rocm --strip-components=1
+        rm -f /tmp/rocm-sdk.tar.gz /tmp/rocm-sdk.tar.gz.sha256
+
+        # Create symlinks if needed (SDK bundle may have amdclang but not clang)
+        if [ -f /opt/rocm/bin/amdclang ] && [ ! -f /opt/rocm/bin/clang ]; then
+          sudo ln -sf /opt/rocm/bin/amdclang /opt/rocm/bin/clang
+          sudo ln -sf /opt/rocm/bin/amdclang++ /opt/rocm/bin/clang++
         fi
-        case "$apt_url_prefix" in
-          https://repo.radeon.com/rocm/apt/*) ;;
-          *)
-            echo "::error::apt_url_prefix must point at https://repo.radeon.com/rocm/apt/, got '$apt_url_prefix'"
+        if [ -f /opt/rocm/lib/llvm/bin/amdclang ] && [ ! -f /opt/rocm/lib/llvm/bin/clang ]; then
+          sudo ln -sf /opt/rocm/lib/llvm/bin/amdclang /opt/rocm/lib/llvm/bin/clang
+          sudo ln -sf /opt/rocm/lib/llvm/bin/amdclang++ /opt/rocm/lib/llvm/bin/clang++
+        fi
+
+        # Smoke test
+        echo "Running SDK smoke tests..."
+        for check in \
+          "/opt/rocm/bin/amdclang:compiler binary" \
+          "/opt/rocm/bin/amdclang++:C++ compiler" \
+          "/opt/rocm/bin/hipcc:HIP compiler wrapper" \
+          "/opt/rocm/include/hip/hip_runtime.h:HIP headers" \
+          "/opt/rocm/lib/cmake/rocwmma:rocwmma cmake config" \
+          "/opt/rocm/lib/cmake/rocblas:rocblas cmake config" \
+          "/opt/rocm/lib/llvm/bin/clang:clang symlink"; do
+          path="${check%%:*}"
+          label="${check##*:}"
+          if [ ! -e "$path" ]; then
+            echo "::error::Smoke test FAILED: $label not found at $path"
             exit 1
-            ;;
-        esac
+          fi
+          echo "  OK: $label ($path)"
+        done
 
-        # Resolve latest 7.12.x patch version published at repo.radeon.com by
-        # parsing the deb-mirror directory listing. This is the single source of
-        # truth; no fallback to distro packages or nightly tarballs is allowed.
-        echo "Resolving latest 7.12.x at https://repo.radeon.com/rocm/apt/"
-        listing=$(curl -fsSL https://repo.radeon.com/rocm/apt/ || true)
-        resolved_version=$(echo "$listing" \
-          | grep -oE 'href="7\.12(\.[0-9]+)?/"' \
-          | sed -E 's/.*"(7\.12(\.[0-9]+)?)\/".*/\1/' \
-          | sort -V | tail -1)
-
-        if [ -z "$resolved_version" ]; then
-          echo "::error::ROCm 7.12.x is not yet published at https://repo.radeon.com/rocm/apt/."
-          echo "::error::The stable channel is pinned to AMD's official deb mirror; no"
-          echo "::error::fallback to distro packages or TheRock S3 nightlies is permitted."
-          echo "::error::Retry once AMD publishes 7.12. For local dev use the preview channel (7.2.1)."
-          exit 1
-        fi
-        rocm_apt_url="https://repo.radeon.com/rocm/apt/${resolved_version}"
-
-        echo "Resolved stable ROCm version: $resolved_version"
-        echo "Installing from AMD apt: $rocm_apt_url"
-
-        sudo mkdir --parents --mode=0755 /etc/apt/keyrings
-        wget -q https://repo.radeon.com/rocm/rocm.gpg.key -O - | \
-          gpg --dearmor | sudo tee /etc/apt/keyrings/rocm.gpg > /dev/null
-
-        echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] ${rocm_apt_url} jammy main" \
-          | sudo tee /etc/apt/sources.list.d/rocm.list
-
-        # Pin packages to repo.radeon.com only - block any distro ROCm package.
-        printf 'Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600\n' \
-          | sudo tee /etc/apt/preferences.d/rocm-pin-600
-
-        sudo apt-get update
-        sudo apt-get install -y \
-          hip-dev rocblas-dev hipblas-dev hipblaslt-dev rocsolver-dev \
-          rocthrust-dev rocprim-dev hiprand-dev rocrand-dev rocwmma-dev
-
-        echo "Installed ROCm stable: $resolved_version (source: $rocm_apt_url)"
-        echo "DETECTED_ROCM_VERSION=$resolved_version" >> $GITHUB_ENV
+        echo "Installed ROCm stable: $rocm_version (source: SDK bundle from $release_repo)"
+        echo "DETECTED_ROCM_VERSION=$rocm_version" >> $GITHUB_ENV
         echo "DETECTED_ROCM_CHANNEL=stable" >> $GITHUB_ENV
 
     - name: Map GPU targets
@@ -277,6 +276,27 @@ jobs:
           build/_deps/mlx-subbuild
         key: mlx-src-linux-${{ hashFiles('CMakeLists.txt') }}
 
+    - name: Locate ROCm compiler
+      id: rocm-compiler
+      run: |
+        # SDK bundle may ship amdclang at /opt/rocm/bin/amdclang while
+        # the apt-installed ROCm places clang at /opt/rocm/lib/llvm/bin/clang.
+        # Probe for whichever exists so the build step works for both channels.
+        if [ -f /opt/rocm/lib/llvm/bin/clang ]; then
+          CC=/opt/rocm/lib/llvm/bin/clang
+          CXX=/opt/rocm/lib/llvm/bin/clang++
+        elif [ -f /opt/rocm/bin/amdclang ]; then
+          CC=/opt/rocm/bin/amdclang
+          CXX=/opt/rocm/bin/amdclang++
+        else
+          echo "::error::No ROCm C compiler found under /opt/rocm"
+          exit 1
+        fi
+        echo "cc=$CC" >> $GITHUB_OUTPUT
+        echo "cxx=$CXX" >> $GITHUB_OUTPUT
+        echo "Using ROCm C compiler: $CC"
+        echo "Using ROCm C++ compiler: $CXX"
+
     - name: Build MLX Engine + ROCm
       run: |
         export HIP_PATH=/opt/rocm
@@ -286,8 +306,8 @@ jobs:
 
         cmake .. -G Ninja \
           -DCMAKE_BUILD_TYPE=Release \
-          -DCMAKE_C_COMPILER=/opt/rocm/lib/llvm/bin/clang \
-          -DCMAKE_CXX_COMPILER=/opt/rocm/lib/llvm/bin/clang++ \
+          -DCMAKE_C_COMPILER=${{ steps.rocm-compiler.outputs.cc }} \
+          -DCMAKE_CXX_COMPILER=${{ steps.rocm-compiler.outputs.cxx }} \
           -DCMAKE_HIP_ARCHITECTURES="${{ steps.map-targets.outputs.mapped_target }}" \
           -DMLX_BUILD_ROCM=ON \
           -DMLX_LM_BUILD_TESTS=OFF \
